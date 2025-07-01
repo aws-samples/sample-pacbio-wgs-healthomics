@@ -1,0 +1,46 @@
+{
+  "sample_id": {
+    "description": "Sample ID",
+    "optional": false
+  },
+  "sex": {
+    "description": "optional, ['MALE', 'FEMALE', null], default: null",
+    "optional": true
+  },
+  "hifi_reads": {
+    "description": "Array paths of the unaligned bam file",
+    "optional": false
+  },
+  "phenotypes": {
+    "description": "Array of phenotypes HPO types like HP:0001999",
+    "optional": true
+  },
+  "ref_map_file": {
+    "description": "Refmap tsv file included all s3 paths of reference ex: s3://<bucket_path>/GRCh38.ref_map.v2p0p0.aws.tsv",
+    "optional": false
+  },
+  "tertiary_map_file": {
+    "description": "Annotation tsv file included all s3 paths of tertiary analysis ex: ss3://<bucket_path>/GRCh38.tertiary_map.v2p0p0.aws.tsv",
+    "optional": true
+  },
+  "backend": {
+    "description": "AWS-HealthOmics",
+    "optional": false
+  },
+  "container_registry": {
+    "description": "A container registry path Ex: <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com",
+    "optional": false
+  },
+  "preemptible": {
+    "description": "Spot capacities needed? default: false",
+    "optional": true
+  },
+  "gpuType": {
+    "description": "[nvidia-tesla-a10g, nvidia-tesla-t4], default: nvidia-tesla-a10g",
+    "optional": true
+  },
+  "gpu": {
+    "description": "Use of GPUs true or false, default: false",
+    "optional": true
+  }
+}

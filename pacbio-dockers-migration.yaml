@@ -1,0 +1,1179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to migrate PacBio Docker images to ECR with exact repository paths - Security Compliant'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "ECR Configuration"
+        Parameters:
+          - ECRRepositoryPrefix
+          - PermissionsBoundaryArn
+          - AllowedECRRepositoryPattern
+          - AllowedS3BucketPattern
+          - AllowedLogGroupPattern
+          - PythonVersion
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - AlertingEnabled
+          - NotificationEmail
+          - DLQAlarmThreshold
+          - CreateVPCEndpoints
+          - VPCEndpointRouteTableIds
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - SecurityGroupId
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - KmsKeyId
+    ParameterLabels:
+      ECRRepositoryPrefix:
+        default: "ECR Repository Prefix"
+      PermissionsBoundaryArn:
+        default: "Permissions Boundary ARN"
+      AllowedECRRepositoryPattern:
+        default: "Allowed ECR Repository Pattern"
+      AllowedS3BucketPattern:
+        default: "Allowed S3 Bucket Pattern"
+      AllowedLogGroupPattern:
+        default: "Allowed Log Group Pattern"
+      PythonVersion:
+        default: "Python Version"
+      AlertingEnabled:
+        default: "Enable DLQ Alerting"
+      NotificationEmail:
+        default: "Notification Email"
+      DLQAlarmThreshold:
+        default: "DLQ Alarm Threshold"
+      CreateVPCEndpoints:
+        default: "Create VPC Endpoints"
+      VPCEndpointRouteTableIds:
+        default: "VPC Endpoint Route Table IDs"
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      SecurityGroupId:
+        default: "Security Group ID"
+      KmsKeyId:
+        default: "KMS Key ID"
+
+Parameters:
+  ECRRepositoryPrefix:
+    Type: String
+    Default: ''
+    Description: Prefix for ECR repositories (leave empty for no prefix)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for Lambda function
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for Lambda function (use public subnets with NAT gateway for internet access)
+  KmsKeyId:
+    Type: String
+    Description: KMS Key ID for CodeBuild encryption
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Existing security group ID that has been configured to communicate with CodeBuild endpoints
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: Optional ARN of the permissions boundary policy to apply to IAM roles (leave empty to skip)
+  AllowedECRRepositoryPattern:
+    Type: String
+    Default: '*'
+    Description: Pattern for allowed ECR repositories (e.g., 'pacbio-*' or 'omics-*'). Use '*' for all repositories.
+  AllowedS3BucketPattern:
+    Type: String
+    Default: 'codepipeline-*'
+    Description: Pattern for allowed S3 buckets (e.g., 'my-org-*'). Default allows CodePipeline buckets.
+  AllowedLogGroupPattern:
+    Type: String
+    Default: '/aws/*'
+    Description: Pattern for allowed CloudWatch log groups (e.g., '/aws/lambda/my-app-*'). Default allows all AWS service logs.
+  AlertingEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch alarms and SNS notifications for DLQ monitoring
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for DLQ alerts (leave empty to skip email notifications)
+  DLQAlarmThreshold:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+    Description: Number of messages in DLQ that triggers an alarm
+  CreateVPCEndpoints:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create VPC endpoints for AWS services to avoid internet traffic
+  VPCEndpointRouteTableIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Route table IDs for VPC endpoints (leave empty to skip route table association)
+  EnableTerminationProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable termination protection for the stack
+  RollbackOnFailure:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Rollback the stack on failure during creation
+
+Conditions:
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+  AlertingEnabled: !Equals [!Ref AlertingEnabled, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  CreateEmailNotification: !And [!Condition AlertingEnabled, !Condition HasNotificationEmail]
+  CreateVPCEndpoints: !Equals [!Ref CreateVPCEndpoints, 'true']
+  HasRouteTableIds: !Not [!Equals [!Join [',', !Ref VPCEndpointRouteTableIds], '']]
+
+Resources:
+  # Managed policies instead of inline policies
+  CodeBuildServiceRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for CodeBuild service role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # ECR repository-level permissions
+          - Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:CompleteLayerUpload
+            - ecr:InitiateLayerUpload
+            - ecr:PutImage
+            - ecr:UploadLayerPart
+            - ecr:CreateRepository
+            - ecr:DescribeRepositories
+            - ecr:ListImages
+            - ecr:SetRepositoryPolicy
+            - ecr:BatchDeleteImage
+            - ecr:BatchGetImage
+            - ecr:GetDownloadUrlForLayer
+            - ecr:PutImageTagMutability
+            - ecr:DescribeImages
+            Effect: Allow
+            Resource: 
+              - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AllowedECRRepositoryPattern}'
+          # ECR registry-level permissions (requires * resource)
+          - Action:
+            - ecr:GetAuthorizationToken
+            Effect: Allow
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+          - Action:
+            - logs:CreateLogGroup
+            Effect: Allow
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AllowedLogGroupPattern}'
+          - Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AllowedLogGroupPattern}:*'
+          - Action:
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:PutObject
+            Effect: Allow
+            Resource: !Sub 'arn:aws:s3:::${AllowedS3BucketPattern}/*'
+          - Action:
+            - kms:Decrypt
+            - kms:Encrypt
+            - kms:GenerateDataKey*
+            - kms:ReEncrypt*
+            Effect: Allow
+            Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyId}'
+
+  # Create separate policies for EC2 describe actions
+  LambdaEC2DescribeVpcPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for Lambda EC2 describe VPC actions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - ec2:DescribeVpcs
+            Effect: Allow
+            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${VpcId}'
+
+  LambdaEC2DescribeNetworkInterfacesPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for Lambda EC2 describe network interfaces actions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - ec2:DescribeNetworkInterfaces
+            Effect: Allow
+            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+
+  LambdaEC2DescribeSecurityGroupsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for Lambda EC2 describe security groups actions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - ec2:DescribeSecurityGroups
+            Effect: Allow
+            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${SecurityGroupId}'
+
+  # Add a policy for EC2 network interface actions
+  LambdaEC2NetworkInterfacePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for Lambda EC2 network interface actions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - ec2:CreateNetworkInterface
+            - ec2:DeleteNetworkInterface
+            - ec2:AssignPrivateIpAddresses
+            - ec2:UnassignPrivateIpAddresses
+            Effect: Allow
+            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+            Condition:
+              StringEquals:
+                'ec2:vpc': !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${VpcId}'
+
+  LambdaServiceRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for Lambda service role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - codebuild:StartBuild
+            - codebuild:BatchGetBuilds
+            - codebuild:ListBuildsForProject
+            - codebuild:StopBuild
+            Effect: Allow
+            Resource: !GetAtt DockerCodeBuildProject.Arn
+          - Action:
+            - logs:CreateLogGroup
+            Effect: Allow
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AllowedLogGroupPattern}'
+          - Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AllowedLogGroupPattern}:*'
+          - Action:
+            - sqs:SendMessage
+            Effect: Allow
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+          # CloudFormation permissions - scoped to current stack
+          - Action:
+            - cloudformation:SignalResource
+            - cloudformation:DescribeStacks
+            Effect: Allow
+            Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+          # X-Ray permissions for tracing - wildcard policy with region/account conditions
+          - Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+            Effect: Allow
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+                'aws:RequestedAccountId': !Ref 'AWS::AccountId'
+
+  OmicsRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for Omics service role with ECR access
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # ECR repository-level permissions
+          - Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:BatchGetImage
+            - ecr:GetDownloadUrlForLayer
+            - ecr:DescribeRepositories
+            - ecr:ListImages
+            - ecr:DescribeImages
+            Effect: Allow
+            Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AllowedECRRepositoryPattern}'
+          # ECR registry-level permissions (requires * resource)
+          - Action:
+            - ecr:GetAuthorizationToken
+            Effect: Allow
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: !Ref AWS::Region
+
+  # IAM Roles with least privilege
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref CodeBuildServiceRolePolicy
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      Path: /service-role/
+
+  # S3 access policy for Lambda CloudFormation response fallback
+  LambdaS3ResponsePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for Lambda to upload CloudFormation responses to S3
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: 'arn:aws:s3:::cloudformation-custom-resource-response-*/*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+
+  # Add AWSLambdaVPCAccessExecutionRole to the Lambda role
+  TriggerCodeBuildLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref LambdaServiceRolePolicy
+        - !Ref LambdaEC2DescribeVpcPolicy
+        - !Ref LambdaEC2DescribeNetworkInterfacesPolicy
+        - !Ref LambdaEC2DescribeSecurityGroupsPolicy
+        - !Ref LambdaEC2NetworkInterfacePolicy
+        - !Ref LambdaS3ResponsePolicy
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      Path: /service-role/
+
+  OmicsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: omics.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+        - !Ref OmicsRolePolicy
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      Path: /service-role/
+
+  # Dead Letter Queue for Lambda with retention policy
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref KmsKeyId
+      Tags:
+        - Key: Purpose
+          Value: Lambda-DLQ
+        - Key: Stack
+          Value: !Ref AWS::StackName
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  # SNS Topic for DLQ Alerts
+  DLQAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: AlertingEnabled
+    Properties:
+      DisplayName: !Sub '${AWS::StackName} Dead Letter Queue Alerts'
+      KmsMasterKeyId: !Ref KmsKeyId
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  # Email Subscription for DLQ Alerts
+  DLQEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailNotification
+    Properties:
+      Protocol: email
+      TopicArn: !Ref DLQAlertTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for DLQ Message Count
+  DLQMessageCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlertingEnabled
+    Properties:
+      AlarmDescription: !Sub 'Alert when messages appear in ${AWS::StackName} Dead Letter Queue'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: !Ref DLQAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt LambdaDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref DLQAlertTopic
+      OKActions:
+        - !Ref DLQAlertTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for DLQ Age of Oldest Message
+  DLQMessageAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlertingEnabled
+    Properties:
+      AlarmDescription: !Sub 'Alert when messages in ${AWS::StackName} DLQ are aging'
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 2
+      Threshold: 3600  # 1 hour in seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt LambdaDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref DLQAlertTopic
+      OKActions:
+        - !Ref DLQAlertTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Function Error Rate Alarm
+  LambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlertingEnabled
+    Properties:
+      AlarmDescription: !Sub 'Alert when ${AWS::StackName} Lambda function error rate is high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TriggerDockerCodeBuildLambda
+      AlarmActions:
+        - !Ref DLQAlertTopic
+      OKActions:
+        - !Ref DLQAlertTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard for DLQ Monitoring
+  DLQMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: AlertingEnabled
+    Properties:
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${LambdaDeadLetterQueue.QueueName}" ],
+                  [ ".", "ApproximateNumberOfMessagesNotVisible", ".", "." ],
+                  [ ".", "ApproximateAgeOfOldestMessage", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Dead Letter Queue Metrics",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${TriggerDockerCodeBuildLambda}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Throttles", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${TriggerDockerCodeBuildLambda}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Lambda Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # VPC Endpoints for secure AWS service access
+  # CodeBuild VPC Endpoint
+  CodeBuildVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.codebuild'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - codebuild:StartBuild
+              - codebuild:BatchGetBuilds
+            Resource: !GetAtt DockerCodeBuildProject.Arn
+      RouteTableIds: !If [HasRouteTableIds, !Ref VPCEndpointRouteTableIds, !Ref 'AWS::NoValue']
+
+  # CloudFormation VPC Endpoint
+  CloudFormationVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:SignalResource
+            Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+      RouteTableIds: !If [HasRouteTableIds, !Ref VPCEndpointRouteTableIds, !Ref 'AWS::NoValue']
+
+  # CloudWatch Logs VPC Endpoint
+  CloudWatchLogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AllowedLogGroupPattern}:*'
+      RouteTableIds: !If [HasRouteTableIds, !Ref VPCEndpointRouteTableIds, !Ref 'AWS::NoValue']
+
+  # SQS VPC Endpoint (for DLQ access)
+  SQSVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - sqs:SendMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+      RouteTableIds: !If [HasRouteTableIds, !Ref VPCEndpointRouteTableIds, !Ref 'AWS::NoValue']
+
+  # X-Ray VPC Endpoint (for tracing)
+  XRayVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.xray'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+            Resource: !Sub 'arn:aws:xray:${AWS::Region}:${AWS::AccountId}:*'
+      RouteTableIds: !If [HasRouteTableIds, !Ref VPCEndpointRouteTableIds, !Ref 'AWS::NoValue']
+
+  # S3 VPC Endpoint (for CloudFormation response fallback)
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: !If [HasRouteTableIds, !Ref VPCEndpointRouteTableIds, !Ref 'AWS::NoValue']
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: 
+              - 'arn:aws:s3:::cloudformation-custom-resource-response-*/*'
+              - !Sub 'arn:aws:s3:::${AllowedS3BucketPattern}/*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+
+  # CloudWatch VPC Endpoint (for metrics and alarms)
+  CloudWatchVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - cloudwatch:PutMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:ListMetrics
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+      RouteTableIds: !If [HasRouteTableIds, !Ref VPCEndpointRouteTableIds, !Ref 'AWS::NoValue']
+
+  # CloudWatch Log Groups with explicit retention
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/pacbio-docker-migration-${AWS::Region}'
+      RetentionInDays: 30
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-TriggerDockerCodeBuildLambda'
+      RetentionInDays: 30
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  # CodeBuild project with secure configuration and increased timeout
+  DockerCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - CodeBuildLogGroup
+    DeletionPolicy: Delete
+    Properties:
+      Name: !Sub 'pacbio-docker-migration-${AWS::Region}'
+      Description: 'Project to migrate PacBio Docker images to ECR'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      EncryptionKey: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyId}'
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE  
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: LOG_LEVEL
+            Value: ERROR
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo "Using default Python version in the container"
+                - python3 --version
+                - pip3 install docker requests
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws --version
+                - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - echo "Creating manifest file"
+                - echo "quay.io/pacbio/glnexus@sha256:ce6fecf59dddc6089a8100b31c29c1e6ed50a0cf123da9f2bc589ee4b0c69c8e" > manifest.txt
+                - echo "quay.io/pacbio/hificnv@sha256:c4764a70c8c2028edb1cdb4352997269947c5076ddd1aeaeef6c5076c630304d" >> manifest.txt
+                - echo "quay.io/pacbio/hiphase@sha256:47fe7d42aea6b1b2e6d3c7401bc35a184464c3f647473d0525c00f3c968b40ad" >> manifest.txt
+                - echo "quay.io/pacbio/mosdepth@sha256:63f7a5d1a4a17b71e66d755d3301a951e50f6b63777d34dab3ee9e182fd7acb1" >> manifest.txt
+                - echo "quay.io/pacbio/paraphase@sha256:2823f94682498704bd63fc95314095917fc1cb31a62a674e9d951cec469d2f3e" >> manifest.txt
+                - echo "quay.io/pacbio/pb-cpg-tools@sha256:afd5468a423fe089f1437d525fdc19c704296f723958739a6fe226caa01fba1c" >> manifest.txt
+                - echo "quay.io/pacbio/pb_wdl_base@sha256:4b889a1f21a6a7fecf18820613cf610103966a93218de772caba126ab70a8e87" >> manifest.txt
+                - echo "quay.io/pacbio/pbmm2@sha256:5f3f4d1f5dbea5cd4c388ee26b2fecbbb7dbcef449343633e039dca3d3725859" >> manifest.txt
+                - echo "quay.io/pacbio/pbstarphase@sha256:426764fb09eadbc5de8aea2450b5fe55000c1dd7aaa2ea7b0f5438f34ea63e3d" >> manifest.txt
+                - echo "quay.io/pacbio/pbsv@sha256:2134be37f71b5b2cb41f364736fe5ea14cf8e70403ba41af5005ce50b64086e4" >> manifest.txt
+                - echo "quay.io/pacbio/slivar@sha256:f71a27f756e2d69ec30949cbea97c54abbafde757562a98ef965f21a28aa8eaa" >> manifest.txt
+                - echo "quay.io/pacbio/svpack@sha256:628e9851e425ed8044a907d33de04043d1ef02d4d2b2667cf2e9a389bb011eba" >> manifest.txt
+                - echo "quay.io/pacbio/trgt@sha256:be7e6ef589a31f4de5d2ed4725dfb34b4b23cb9a440577b606e8f7bfee06526b" >> manifest.txt
+                - echo "quay.io/pacbio/wgs_tertiary@sha256:410597030e0c85cf16eb27a877d260e7e2824747f5e8b05566a1aaa729d71136" >> manifest.txt
+                - echo "google/deepvariant:1.6.1" >> manifest.txt
+                - echo "google/deepvariant:1.6.1-gpu" >> manifest.txt
+                - echo "pgkb/pharmcat:2.15.4" >> manifest.txt
+                - yum install -y jq
+                - mkdir -p /tmp/ecr-repos
+            build:
+              commands:
+                - echo Build started on `date`
+                - |
+                  # Process images in parallel batches to speed up the process
+                  BATCH_SIZE=3  # Process 3 images at a time
+                  TOTAL_IMAGES=$(wc -l < manifest.txt)
+                  BATCH_COUNT=$(( (TOTAL_IMAGES + BATCH_SIZE - 1) / BATCH_SIZE ))
+                  
+                  echo "Total images: $TOTAL_IMAGES, Processing in $BATCH_COUNT batches of $BATCH_SIZE"
+                  
+                  for ((batch=0; batch<BATCH_COUNT; batch++)); do
+                    START_IDX=$((batch * BATCH_SIZE + 1))
+                    END_IDX=$(((batch + 1) * BATCH_SIZE))
+                    
+                    if [ $END_IDX -gt $TOTAL_IMAGES ]; then
+                      END_IDX=$TOTAL_IMAGES
+                    fi
+                    
+                    echo "Processing batch $((batch + 1))/$BATCH_COUNT (images $START_IDX-$END_IDX)"
+                    
+                    # Extract the current batch of images
+                    sed -n "${START_IDX},${END_IDX}p" manifest.txt > /tmp/current_batch.txt
+                    
+                    # Process images in the current batch in parallel
+                    cat /tmp/current_batch.txt | while read IMAGE; do
+                    (
+                      echo "Processing $IMAGE"
+                      
+                      if [[ $IMAGE == *"@sha256:"* ]]; then
+                        DIGEST=$(echo $IMAGE | cut -d'@' -f2)
+                        IMAGE_WITHOUT_DIGEST=$(echo $IMAGE | cut -d'@' -f1)
+                        REPO_NAME=$(basename $IMAGE_WITHOUT_DIGEST)
+                        TAG="latest"
+                      else
+                        if [[ $IMAGE == *":"* ]]; then
+                          TAG=$(echo $IMAGE | cut -d':' -f2)
+                          IMAGE_WITHOUT_TAG=$(echo $IMAGE | cut -d':' -f1)
+                          REPO_NAME=$(basename $IMAGE_WITHOUT_TAG)
+                        else
+                          REPO_NAME=$(basename $IMAGE)
+                          TAG="latest"
+                        fi
+                      fi
+                      
+                      # Add prefix if specified
+                      if [ -n "$ECR_REPO_PREFIX" ]; then
+                        if [[ "$ECR_REPO_PREFIX" != */ ]]; then
+                          ECR_REPO_PREFIX="${ECR_REPO_PREFIX}/"
+                        fi
+                        FULL_REPO_NAME="${ECR_REPO_PREFIX}${REPO_NAME}"
+                      else
+                        FULL_REPO_NAME="${REPO_NAME}"
+                      fi
+                      
+                      # Check if repository exists, create if not
+                      aws ecr describe-repositories --repository-names ${FULL_REPO_NAME} || aws ecr create-repository --repository-name ${FULL_REPO_NAME}
+                      
+                      # Pull the image with retry logic
+                      MAX_PULL_ATTEMPTS=3
+                      PULL_ATTEMPT=1
+                      PULL_SUCCESS=false
+                      
+                      while [ $PULL_ATTEMPT -le $MAX_PULL_ATTEMPTS ] && [ "$PULL_SUCCESS" = "false" ]; do
+                        echo "Pulling ${IMAGE} (attempt $PULL_ATTEMPT/$MAX_PULL_ATTEMPTS)"
+                        if docker pull ${IMAGE}; then
+                          PULL_SUCCESS=true
+                          echo "Successfully pulled ${IMAGE}"
+                        else
+                          echo "Failed to pull ${IMAGE} on attempt $PULL_ATTEMPT"
+                          if [ $PULL_ATTEMPT -lt $MAX_PULL_ATTEMPTS ]; then
+                            SLEEP_TIME=$((PULL_ATTEMPT * 5))
+                            echo "Retrying in $SLEEP_TIME seconds..."
+                            sleep $SLEEP_TIME
+                          fi
+                        fi
+                        PULL_ATTEMPT=$((PULL_ATTEMPT + 1))
+                      done
+                      
+                      if [ "$PULL_SUCCESS" = "false" ]; then
+                        echo "Failed to pull ${IMAGE} after $MAX_PULL_ATTEMPTS attempts, skipping"
+                        echo "${IMAGE}" >> /tmp/failed_images.txt
+                        exit 0
+                      fi
+                      
+                      # Tag for ECR
+                      ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${FULL_REPO_NAME}:${TAG}"
+                      echo "Tagging ${IMAGE} as ${ECR_URI}"
+                      docker tag ${IMAGE} ${ECR_URI}
+                      
+                      # Push to ECR with retry logic
+                      MAX_PUSH_ATTEMPTS=3
+                      PUSH_ATTEMPT=1
+                      PUSH_SUCCESS=false
+                      
+                      while [ $PUSH_ATTEMPT -le $MAX_PUSH_ATTEMPTS ] && [ "$PUSH_SUCCESS" = "false" ]; do
+                        echo "Pushing ${ECR_URI} (attempt $PUSH_ATTEMPT/$MAX_PUSH_ATTEMPTS)"
+                        if docker push ${ECR_URI}; then
+                          PUSH_SUCCESS=true
+                          echo "Successfully pushed ${ECR_URI}"
+                        else
+                          echo "Failed to push ${ECR_URI} on attempt $PUSH_ATTEMPT"
+                          if [ $PUSH_ATTEMPT -lt $MAX_PUSH_ATTEMPTS ]; then
+                            SLEEP_TIME=$((PUSH_ATTEMPT * 5))
+                            echo "Retrying in $SLEEP_TIME seconds..."
+                            sleep $SLEEP_TIME
+                          fi
+                        fi
+                        PUSH_ATTEMPT=$((PUSH_ATTEMPT + 1))
+                      done
+                      
+                      if [ "$PUSH_SUCCESS" = "false" ]; then
+                        echo "Failed to push ${ECR_URI} after $MAX_PUSH_ATTEMPTS attempts, marking as failed"
+                        echo "${IMAGE}" >> /tmp/failed_images.txt
+                      else
+                        echo "Successfully migrated ${IMAGE} to ${ECR_URI}"
+                        echo "${IMAGE}" >> /tmp/successful_images.txt
+                      fi
+                      
+                      # Clean up to save disk space
+                      docker rmi ${IMAGE} ${ECR_URI} || true
+                    ) &
+                    done
+                    
+                    # Wait for all parallel processes to complete
+                    wait
+                    echo "Completed batch $((batch + 1))/$BATCH_COUNT"
+                  done
+                  
+                  # Report results
+                  echo "Migration complete"
+                  if [ -f /tmp/successful_images.txt ]; then
+                    SUCCESSFUL_COUNT=$(wc -l < /tmp/successful_images.txt)
+                    echo "Successfully migrated $SUCCESSFUL_COUNT images"
+                  else
+                    echo "No images were successfully migrated"
+                  fi
+                  
+                  if [ -f /tmp/failed_images.txt ]; then
+                    FAILED_COUNT=$(wc -l < /tmp/failed_images.txt)
+                    echo "Failed to migrate $FAILED_COUNT images:"
+                    cat /tmp/failed_images.txt
+                    
+                    # If all images failed, exit with error
+                    if [ "$FAILED_COUNT" -eq "$TOTAL_IMAGES" ]; then
+                      echo "All images failed to migrate, exiting with error"
+                      exit 1
+                    fi
+                  else
+                    echo "All images were successfully migrated"
+                  fi
+                - echo Build completed on `date`
+      TimeoutInMinutes: 60
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/pacbio-docker-migration-${AWS::Region}'
+
+  # Lambda function with VPC, timeout, and concurrency limits
+  # Add DependsOn to ensure the role has the necessary permissions before Lambda creation
+  TriggerDockerCodeBuildLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - TriggerCodeBuildLambdaRole
+      - LambdaEC2NetworkInterfacePolicy
+      - LambdaLogGroup
+    Properties:
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt TriggerCodeBuildLambdaRole.Arn
+      Timeout: 300  # As per your modification
+      MemorySize: 256  # As per your modification
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import traceback
+          
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              # Extract response URL immediately
+              response_url = event.get('ResponseURL')
+              print(f"Response URL: {response_url}")
+              
+              # Check request type
+              request_type = event.get('RequestType', '')
+              print(f"Request type: {request_type}")
+              
+              try:
+                  if request_type == 'Create' or request_type == 'Update':
+                      # Use the same region as the stack
+                      region = event['StackId'].split(':')[3]
+                      codebuild = boto3.client('codebuild', region_name=region)
+                      
+                      project_name = event['ResourceProperties'].get('ProjectName')
+                      repo_prefix = event['ResourceProperties'].get('RepoPrefix')
+                      
+                      print(f"Starting CodeBuild project: {project_name}")
+                      response = codebuild.start_build(
+                          projectName=project_name,
+                          environmentVariablesOverride=[
+                              {
+                                  'name': 'ECR_REPO_PREFIX',
+                                  'value': repo_prefix,
+                                  'type': 'PLAINTEXT'
+                              }
+                          ]
+                      )
+                      
+                      build_id = response['build']['id']
+                      print(f"Started build with ID: {build_id}")
+                      
+                      # Send success response
+                      send_response(event, context, "SUCCESS", {
+                          "Message": "Docker images migration started successfully",
+                          "BuildId": build_id
+                      })
+                      
+                  elif request_type == 'Delete':
+                      # For Delete, just acknowledge - no need to do anything else
+                      print("Delete operation - sending success response immediately")
+                      send_response(event, context, "SUCCESS", {"Message": "Delete request processed"})
+                  
+                  else:
+                      # Invalid request type
+                      print(f"Invalid request type: {request_type}")
+                      send_response(event, context, "FAILED", {"Error": f"Invalid request type: {request_type}"})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  print(traceback.format_exc())
+                  # Always send a response, even on failure
+                  # For delete events, always return success to avoid stack getting stuck
+                  if request_type == 'Delete':
+                      send_response(event, context, "SUCCESS", {"Message": "Delete completed with warnings"})
+                  else:
+                      send_response(event, context, "FAILED", {"Error": str(e)})
+              
+              return {"Status": "SUCCESS"}
+          
+          def send_response(event, context, status, data):
+              """Send response to CloudFormation with multiple fallback methods"""
+              response_body = {
+                  'Status': status,
+                  'Reason': f"See details in CloudWatch Log Stream: {context.log_stream_name}",
+                  'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data
+              }
+              
+              response_url = event.get('ResponseURL')
+              if not response_url:
+                  print("No response URL found in event")
+                  return False
+              
+              print(f"Sending response to: {response_url}")
+              print(f"Response body: {json.dumps(response_body)}")
+              
+              # Method 1: Direct HTTP PUT request with short timeout
+              try:
+                  http = urllib3.PoolManager(timeout=urllib3.Timeout(connect=10.0, read=10.0))
+                  response = http.request(
+                      'PUT',
+                      response_url,
+                      body=json.dumps(response_body).encode('utf-8'),
+                      headers={'Content-Type': 'application/json'},
+                      retries=urllib3.Retry(
+                          total=3,
+                          backoff_factor=0.3,
+                          status_forcelist=[500, 502, 503, 504]
+                      )
+                  )
+                  print(f"HTTP response status code: {response.status}")
+                  if response.status >= 200 and response.status < 300:
+                      return True
+                  else:
+                      print(f"HTTP request failed with status {response.status}")
+              except Exception as e:
+                  print(f"HTTP request failed: {str(e)}")
+              
+              # Method 2: Use S3 client directly
+              try:
+                  print("Trying S3 method")
+                  
+                  # Parse the S3 URL
+                  if 's3.amazonaws.com' in response_url:
+                      url_parts = response_url.split('/')
+                      bucket = url_parts[2].split('.')[0]
+                      key = '/'.join(url_parts[3:])
+                      
+                      # Create S3 client
+                      s3_client = boto3.client('s3')
+                      
+                      # Put the response object directly to S3
+                      s3_client.put_object(
+                          Bucket=bucket,
+                          Key=key,
+                          Body=json.dumps(response_body),
+                          ContentType='application/json'
+                      )
+                      print(f"Successfully sent response via S3 to bucket {bucket}")
+                      return True
+                  else:
+                      print("Response URL is not an S3 URL, cannot use S3 method")
+              except Exception as e:
+                  print(f"S3 method failed: {str(e)}")
+              
+              print("All response methods failed")
+              return False
+
+  TriggerDockerCodeBuild:
+    Type: Custom::TriggerDockerCodeBuild
+    DependsOn:
+      - TriggerDockerCodeBuildLambda
+      - DockerCodeBuildProject
+    Properties:
+      ServiceToken: !GetAtt TriggerDockerCodeBuildLambda.Arn
+      ProjectName: !Ref DockerCodeBuildProject
+      RepoPrefix: !Ref ECRRepositoryPrefix
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+Outputs:
+  StackStatus:
+    Description: Status of the CloudFormation stack deployment
+    Value: !Sub '${AWS::StackName} deployed successfully'
+  OmicsRoleArn:
+    Description: ARN of the OmicsRole
+    Value: !GetAtt OmicsRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OmicsRoleArn'
+  CodeBuildProjectName:
+    Description: Name of the CodeBuild project
+    Value: !Ref DockerCodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProjectName'
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt TriggerDockerCodeBuildLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+  DeadLetterQueueUrl:
+    Description: URL of the Dead Letter Queue
+    Value: !Ref LambdaDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+  DLQAlertTopicArn:
+    Condition: AlertingEnabled
+    Description: ARN of the SNS topic for DLQ alerts
+    Value: !Ref DLQAlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQAlertTopicArn'
+  DLQMonitoringDashboard:
+    Condition: AlertingEnabled
+    Description: CloudWatch Dashboard URL for DLQ monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DLQMonitoringDashboard}'
+  VPCEndpointsCreated:
+    Condition: CreateVPCEndpoints
+    Description: List of VPC endpoints created for secure AWS service access
+    Value: !Join
+      - ', '
+      - - !Ref CodeBuildVPCEndpoint
+        - !Ref CloudFormationVPCEndpoint
+        - !Ref CloudWatchLogsVPCEndpoint
+        - !Ref SQSVPCEndpoint
+        - !Ref XRayVPCEndpoint
+        - !Ref CloudWatchVPCEndpoint
+        - !Ref S3VPCEndpoint

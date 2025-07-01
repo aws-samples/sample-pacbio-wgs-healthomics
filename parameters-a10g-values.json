@@ -1,0 +1,15 @@
+{
+  "sample_id": "HG002",
+  "sex": "MALE",
+  "hifi_reads": [
+	  "s3://<YOUR_S3_BUCKET>/omics/pacbio/m84011_220902_175841_s1.hifi_reads.bam"
+  ],
+  "phenotypes": "HP:0001999",
+  "ref_map_file": "s3://<YOUR_S3_BUCKET>/pacbio/hifi-wdl-resources-v2.0.0/GRCh38.ref_map.v2p0p0.template.tsv",
+  "tertiary_map_file": "s3://<YOUR_S3_BUCKET>/pacbio/hifi-wdl-resources-v2.0.0/GRCh38.tertiary_map.v2p0p0.template.tsv",
+  "backend": "AWS-HealthOmics",
+  "container_registry": "<YOUR_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com",
+  "preemptible": false,
+  "gpu": true,
+  "gpuType": "nvidia-tesla-a10g"
+}
