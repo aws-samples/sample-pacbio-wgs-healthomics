@@ -201,7 +201,6 @@ aws omics get-run-task --id ${WORKFLOW_RUN_ID} --task-id <TASK_ID> --profile <YO
 ## Cost Optimization
 
 - Use appropriate instance types based on your data size and processing requirements
-- Consider using Spot instances for cost savings (configure in parameter templates)
 - Implement workflow caching to avoid re-running completed tasks
 - Monitor resource utilization and adjust instance types accordingly
 
